@@ -5,7 +5,7 @@ description = "Instagram Reels/Stories downloader (original quality)"
 requires-python = ">=3.10"
 dependencies = [
   "flet==0.28.3",
-  "yt-dlp",
+  "yt-dlp[default]",
   "gallery-dl",
 ]
 

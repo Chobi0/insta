@@ -1,5 +1,5 @@
 flet[all]==0.28.3
-yt-dlp
+yt-dlp[default]
 gallery-dl
 imageio-ffmpeg
 pyinstaller

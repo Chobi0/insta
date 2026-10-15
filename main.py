@@ -18,11 +18,12 @@ try:
 except Exception:  # 사진/캐러셀/하이라이트용 보조 엔진
     gdl_config = gdl_job = None
 
-URL_RE = re.compile(r"https?://(?:www\.)?instagram\.com/[^\s]+", re.I)
+URL_RE = re.compile(r"https?://[^\s]+", re.I)
 SEED = "#5B6CFF"
 MEDIA = {".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".wav", ".flac", ".jpg", ".jpeg", ".png", ".webp", ".gif"}
 IMG = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-QUALITY = {"원본 최고 화질": None, "1080p 이하": 1080, "720p 이하": 720, "480p 이하": 480, "오디오만 (m4a)": "audio"}
+QUALITY = {"원본 최고 화질": None, "1080p 이하": 1080, "720p 이하": 720, "480p 이하": 480, "오디오만 (m4a/opus 원본)": "audio", "MP3로 변환 (192k)": "mp3"}
+YT_TEMPLATE = "%(extractor_key)s/%(uploader|unknown)s/%(title).80s [%(id)s].%(ext)s"
 TEMPLATES = {
     "계정/날짜_ID": "%(uploader)s/%(upload_date)s_%(id)s.%(ext)s",
     "날짜_계정_ID (폴더 없음)": "%(upload_date)s_%(uploader)s_%(id)s.%(ext)s",
@@ -96,6 +97,79 @@ def human(n):
         n /= 1024
 
 
+def find_deno():
+    """유튜브 서명 해독에 필요한 JS 런타임(deno). EXE에 같이 묶여 있으면 그걸 사용."""
+    for d in filter(None, [getattr(sys, "_MEIPASS", None), os.path.dirname(sys.executable)]):
+        for n in ("deno.exe", "deno"):
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+    return shutil.which("deno")
+
+
+def size_of(f):
+    return f.get("filesize") or f.get("filesize_approx")
+
+
+def fmt_dur(sec):
+    if not sec:
+        return ""
+    sec = int(sec)
+    h, r = divmod(sec, 3600)
+    m, s_ = divmod(r, 60)
+    return f"{h}:{m:02d}:{s_:02d}" if h else f"{m}:{s_:02d}"
+
+
+def make_choices(info, has_ffmpeg):
+    """분석 결과 → 선택지 목록 [{label, fmt, post, size, group}] (영상별 예상 용량 포함)"""
+    sz = lambda n: f"약 {human(n)}" if n else "용량 미상"
+    ch, fs = [], info.get("formats") or []
+    if info.get("_type") == "playlist":
+        n = len(info.get("entries") or [])
+        base = [("최고 화질", "bv*+ba/b" if has_ffmpeg else "b", None), ("1080p 이하", "bv*[height<=1080]+ba/b[height<=1080]/b", None),
+                ("720p 이하", "bv*[height<=720]+ba/b[height<=720]/b", None), ("오디오 원본", "ba/b", None)]
+        if has_ffmpeg:
+            base.append(("MP3 변환", "ba/b", "mp3"))
+        return [dict(label=f"재생목록 {n}개 · {a}", fmt=b, post=c, size=None, group="재생목록 전체") for a, b, c in base]
+    aud = [f for f in fs if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+    m4a = [f for f in aud if f.get("ext") == "m4a"]
+    ba = max(m4a or aud, key=lambda f: f.get("abr") or 0, default=None)
+    asize = size_of(ba) if ba else None
+    if info.get("is_live"):
+        for h in sorted({f["height"] for f in fs if f.get("height")}, reverse=True):
+            ch.append(dict(label=f"{h}p 이하 · 라이브 녹화 (용량은 녹화 시간에 따라 증가)", group="영상", post=None, size=None,
+                           fmt=f"bv*[height<={h}]+ba/b[height<={h}]/b" if has_ffmpeg else f"b[height<={h}]/b"))
+    else:
+        groups = {}
+        for f in fs:
+            if f.get("vcodec") in (None, "none") or not f.get("height"):
+                continue
+            k = (f["height"], round(f.get("fps") or 0))
+            if k not in groups or (f.get("tbr") or 0) > (groups[k].get("tbr") or 0):
+                groups[k] = f
+        for (h, fps), f in sorted(groups.items(), reverse=True):
+            combined = f.get("acodec") != "none"  # None(알 수 없음)은 소리 포함으로 간주
+            if not combined and not has_ffmpeg:
+                continue  # 폰: 병합 불가
+            if combined:
+                sel, size = f["format_id"], size_of(f)
+            else:
+                sel = f["format_id"] + ("+" + ba["format_id"] if ba else "+ba")
+                size = (size_of(f) + (asize or 0)) if size_of(f) else None
+            codec = (f.get("vcodec") or "").split(".")[0]
+            ch.append(dict(label=f"{h}p" + (f" {fps}fps" if fps else "") + f" · {codec} · {f.get('ext')} · {sz(size)}",
+                           fmt=sel, post=None, size=size, group="영상"))
+        sizes = [c["size"] for c in ch if c["size"]]
+        ch.insert(0, dict(label="자동 최고 화질 (권장)" + (f" · {sz(max(sizes))}" if sizes else ""),
+                          fmt="bv*+ba/b" if has_ffmpeg else "b", post=None, size=max(sizes) if sizes else None, group="영상"))
+    dur = info.get("duration")
+    ch.append(dict(label=f"오디오 원본 (m4a/opus) · {sz(asize)}", fmt="ba/b", post=None, size=asize, group="오디오"))
+    if has_ffmpeg:
+        est = dur * 192000 / 8 if dur else None
+        ch.append(dict(label=f"MP3 변환 192kbps · {sz(est)}(예상)", fmt="ba/b", post="mp3", size=est, group="오디오"))
+    return ch
+
+
 def main(page: ft.Page):
     page.title = "ReelDock"
     page.padding = 0
@@ -157,37 +231,65 @@ def main(page: ft.Page):
             return str(fb)
 
     # ================= 다운로드 엔진 =================
-    def build_opts(hook):
-        q = QUALITY.get(cfg["quality"])
-        if q == "audio":
-            fmt = "ba/b"
-        elif isinstance(q, int):
-            fmt = f"bv*[height<={q}]+ba/b[height<={q}]/b" if ffmpeg else f"b[height<={q}]/b"
-        else:
-            fmt = "bv*+ba/b" if ffmpeg else "b"
-        o = {
-            "outtmpl": os.path.join(ensure_outdir(), TEMPLATES.get(cfg["template"], TEMPLATES["계정/날짜_ID"])),
-            "format": fmt, "format_sort": ["res", "fps", "br"], "merge_output_format": "mp4",
-            "progress_hooks": [hook], "quiet": True, "no_warnings": True, "retries": 5,
-            "fragment_retries": 5, "writethumbnail": bool(cfg["thumb"]), "windowsfilenames": True,
-        }
-        if ffmpeg:
-            o["ffmpeg_location"] = ffmpeg
-        if cfg["skip_dup"]:
-            o["download_archive"] = str(archive_path)
+    deno = find_deno()
+
+    def auth_opts():
+        o = {}
         sid = cfg["sessionid"].strip()
         if sid:
             cookie_path.write_text("# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t"
                                    + sid + "\n", "utf-8")
             o["cookiefile"] = str(cookie_path)
-        elif not is_android and cfg["browser"] != "없음":
+        if not is_android and cfg["browser"] != "없음":
             o["cookiesfrombrowser"] = (cfg["browser"].lower(),)
+        if deno:
+            o["js_runtimes"] = {"deno": {"path": deno}}
+        return o
+
+    def build_opts(hook, url="", fmt=None, post=None, live_start=False):
+        q = QUALITY.get(cfg["quality"])
+        if not fmt:
+            if q in ("audio", "mp3"):
+                fmt, post = "ba/b", ("mp3" if q == "mp3" else None)
+            elif isinstance(q, int):
+                fmt = f"bv*[height<={q}]+ba/b[height<={q}]/b" if ffmpeg else f"b[height<={q}]/b"
+            else:
+                fmt = "bv*+ba/b" if ffmpeg else "b"
+        if post == "mp3" and not ffmpeg:
+            post = None
+        tmpl = TEMPLATES.get(cfg["template"], TEMPLATES["계정/날짜_ID"]) if "instagram.com" in url else YT_TEMPLATE
+        o = {
+            "outtmpl": os.path.join(ensure_outdir(), tmpl),
+            "format": fmt, "format_sort": ["res", "fps", "br"], "merge_output_format": "mp4",
+            "progress_hooks": [hook], "quiet": True, "no_warnings": True, "retries": 5,
+            "fragment_retries": 5, "writethumbnail": bool(cfg["thumb"]), "windowsfilenames": True,
+            "noplaylist": "/playlist" not in url,
+        }
+        if post == "mp3":
+            o["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+        if live_start:
+            o["live_from_start"] = True
+        if ffmpeg:
+            o["ffmpeg_location"] = ffmpeg
+        if cfg["skip_dup"]:
+            o["download_archive"] = str(archive_path)
+        o.update(auth_opts())
         return o
 
     def friendly_error(e):
         low = str(e).lower()
+        if "sign in to confirm" in low or "not a bot" in low:
+            return "유튜브 봇 확인 요구 → 설정에서 로그인한 브라우저 쿠키 선택 (PC)"
+        if "javascript runtime" in low or "js runtime" in low:
+            return "유튜브용 JS 런타임 없음 → PC 최신 빌드 사용 (폰은 일부 영상만 가능)"
+        if "private video" in low or "video unavailable" in low or "has been removed" in low:
+            return "비공개/삭제된 영상이에요"
+        if "premieres in" in low or "will begin in" in low or "live event" in low:
+            return "아직 시작 전인 영상/라이브예요"
+        if "age" in low and "restrict" in low:
+            return "연령 제한 영상 → 로그인 쿠키 필요"
         if any(k in low for k in ("login", "cookie", "private", "not available", "empty media")):
-            return "로그인 필요/비공개 → 설정에서 sessionid 입력"
+            return "로그인 필요/비공개 → 설정에서 sessionid 또는 브라우저 쿠키 사용"
         if "rate" in low or "429" in low:
             return "요청 제한 → 잠시 후 다시 시도"
         return str(e).split("\n")[-1][:120]
@@ -206,12 +308,13 @@ def main(page: ft.Page):
         title = ft.Text(title_txt, size=14, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
         status = ft.Text(status_txt, size=12, color=color or ft.Colors.ON_SURFACE_VARIANT)
         bar = ft.ProgressBar(value=progress, height=6, border_radius=3)
+        stop = ft.IconButton(I.CLOSE, icon_size=18, tooltip="중지", visible=False)
         card = ft.Container(
             padding=14, border_radius=18, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
             content=ft.Row([ft.Icon(I.MOVIE_CREATION_OUTLINED, size=30, color=SEED),
-                            ft.Column([title, status, bar], spacing=4, expand=True)], spacing=12),
+                            ft.Column([title, status, bar], spacing=4, expand=True), stop], spacing=12),
         )
-        return card, title, status, bar
+        return card, title, status, bar, stop
 
     def add_history(title, url, paths):
         history.insert(0, {"title": title, "url": url, "paths": paths, "time": time.strftime("%m-%d %H:%M")})
@@ -260,10 +363,18 @@ def main(page: ft.Page):
             raise RuntimeError(f"받을 수 있는 파일이 없어요 (코드 {status})")
         return files
 
-    def start_job(url, include=None):
-        card, title, status, bar = job_card(url, "대기 중...", None)
+    def start_job(url, include=None, fmt=None, post=None, live_start=False):
+        card, title, status, bar, stop = job_card(url, "대기 중...", None)
+        cancel = {"v": False}
         jobs_col.controls.insert(0, card)
         page.update()
+
+        def on_stop(e):
+            cancel["v"] = True
+            status.value = "중지하는 중..."
+            page.update()
+
+        stop.on_click = on_stop
 
         def setp(txt, val=None, color=None):
             status.value, bar.value = txt, val
@@ -273,16 +384,24 @@ def main(page: ft.Page):
 
         def hook(d):
             if d["status"] == "downloading":
+                if cancel["v"]:
+                    raise yt_dlp.utils.DownloadCancelled()
+                done = d.get("downloaded_bytes") or 0
                 tot = d.get("total_bytes") or d.get("total_bytes_estimate")
-                p = (d.get("downloaded_bytes") or 0) / tot if tot else None
+                p = done / tot if tot else None
                 sp = d.get("speed")
-                setp(f"{(p or 0) * 100:.0f}%  " + (f"{sp / 1048576:.1f}MB/s" if sp else ""), p)
+                setp((f"{p * 100:.0f}%" if p is not None else human(done)) + "  "
+                     + (f"{sp / 1048576:.1f}MB/s" if sp else ""), p)
             elif d["status"] == "finished":
                 setp("처리 중...")
 
         def by_ytdlp():
-            with yt_dlp.YoutubeDL(build_opts(hook)) as y:
-                info = y.extract_info(url, download=True)
+            stop.visible = True
+            try:
+                with yt_dlp.YoutubeDL(build_opts(hook, url, fmt, post, live_start)) as y:
+                    info = y.extract_info(url, download=True)
+            finally:
+                stop.visible = False
             if info is None:
                 return None, []
             return str(info.get("title") or info.get("id") or url)[:80], paths_from(info)
@@ -294,11 +413,14 @@ def main(page: ft.Page):
         def worker():
             with sem["v"]:
                 setp("연결 중...")
-                # 릴스는 yt-dlp(원본 영상+음성 병합) 우선, 그 외(사진·캐러셀·스토리·계정)는 gallery-dl 우선
+                is_ig = "instagram.com" in url
+                # 인스타: 릴스는 yt-dlp 우선, 사진·캐러셀·스토리·계정은 gallery-dl 우선 / 그 외 사이트(유튜브 등)는 yt-dlp
                 is_reel = re.search(r"/(reel|reels|tv)/", url) and not include
                 order = [by_ytdlp, by_gdl] if is_reel else [by_gdl, by_ytdlp]
                 if include:
                     order = [by_gdl]
+                if not is_ig or fmt:
+                    order = [by_ytdlp]
                 first_err = None
                 for fn in order:
                     try:
@@ -310,6 +432,9 @@ def main(page: ft.Page):
                         else:
                             setp("이미 받은 항목 (건너뜀)", 1, ft.Colors.AMBER)
                         return
+                    except yt_dlp.utils.DownloadCancelled:
+                        setp("중지됨 (받던 부분은 .part 파일로 남아요)", 0, ft.Colors.AMBER)
+                        return
                     except Exception as e:
                         first_err = first_err or e
                 setp("실패: " + friendly_error(first_err), 0, ft.Colors.RED_300)
@@ -318,7 +443,7 @@ def main(page: ft.Page):
 
     if cfg["remember"]:
         for h in history[:5]:
-            c, t, s, b = job_card(h["title"], f'{h["time"]} · {len(h.get("paths") or [])}개 · 완료', 1)
+            c, t, s, b, _ = job_card(h["title"], f'{h["time"]} · {len(h.get("paths") or [])}개 · 완료', 1)
             jobs_col.controls.append(c)
 
     # ================= ffmpeg 도구 =================
@@ -490,7 +615,7 @@ def main(page: ft.Page):
         unlock_vault(lambda: show_custom(vault_view()))
 
     # ================= 홈 =================
-    url_field = ft.TextField(hint_text="게시물·릴스·스토리 링크 붙여넣기 (여러 개 가능)", multiline=True, min_lines=1,
+    url_field = ft.TextField(hint_text="인스타·유튜브 등 링크 붙여넣기 (여러 개 가능)", multiline=True, min_lines=1,
                              max_lines=4, filled=True, bgcolor="#FFFFFF", color="#1B1B1F", border_radius=16,
                              border=ft.InputBorder.NONE, hint_style=ft.TextStyle(color="#7A7A85", size=13),
                              prefix_icon=I.LINK)
@@ -507,7 +632,7 @@ def main(page: ft.Page):
     def download(e):
         urls = list(dict.fromkeys(URL_RE.findall(url_field.value or "")))
         if not urls:
-            toast("인스타그램 링크를 찾지 못했어요")
+            toast("링크를 찾지 못했어요")
             return
         for u in urls:
             start_job(u.rstrip(").,"))
@@ -534,6 +659,58 @@ def main(page: ft.Page):
                                       ft.FilledButton("받기", on_click=go)])
         page.open(dlg)
 
+    def preview(e=None):
+        urls = URL_RE.findall(url_field.value or "")
+        if not urls:
+            toast("링크를 먼저 붙여넣어 주세요")
+            return
+        url = urls[0].rstrip(").,")
+        wait = ft.AlertDialog(title=ft.Text("분석 중..."), content=ft.Row([ft.ProgressRing(), ft.Text("화질/용량 확인")], spacing=16))
+        page.open(wait)
+
+        def work():
+            try:
+                o = {"quiet": True, "no_warnings": True, "skip_download": True,
+                     "noplaylist": "/playlist" not in url}
+                o.update(auth_opts())
+                if "/playlist" in url:
+                    o["extract_flat"] = "in_playlist"
+                with yt_dlp.YoutubeDL(o) as y:
+                    info = y.extract_info(url, download=False)
+                page.close(wait)
+                show_choices(url, info)
+            except Exception as ex:
+                page.close(wait)
+                toast("분석 실패: " + friendly_error(ex))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_choices(url, info):
+        ch = make_choices(info, bool(ffmpeg))
+        rg = ft.RadioGroup(value="0", content=ft.Column(
+            [ft.Radio(value=str(i), label=c["label"]) for i, c in enumerate(ch)], spacing=0))
+        meta = " · ".join(x for x in [info.get("uploader") or info.get("channel"), fmt_dur(info.get("duration")),
+                                      "🔴 라이브" if info.get("is_live") else ""] if x)
+        live_sw = ft.Switch(label="라이브를 처음부터 녹화", value=False) if info.get("is_live") else None
+        head = ft.Row([
+            ft.Image(src=info["thumbnail"], width=120, height=68, fit=ft.ImageFit.COVER, border_radius=10)
+            if info.get("thumbnail") else ft.Icon(I.MOVIE, size=48),
+            ft.Column([ft.Text(str(info.get("title") or url), max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
+                               weight=ft.FontWeight.W_600), ft.Text(meta, size=12, color=ft.Colors.ON_SURFACE_VARIANT)],
+                      spacing=4, expand=True)], spacing=12)
+        note = ("" if ffmpeg else "휴대폰은 영상+음성 병합이 안 돼 소리 포함 단일 파일 화질만 보여요")
+        col = [head] + ([ft.Text(note, size=11, color=ft.Colors.AMBER)] if note else []) + [rg] + ([live_sw] if live_sw else [])
+
+        def go(ev):
+            c = ch[int(rg.value)]
+            page.close(dlg)
+            start_job(url, fmt=c["fmt"], post=c["post"], live_start=bool(live_sw and live_sw.value))
+
+        dlg = ft.AlertDialog(title=ft.Text("화질/용량 선택"), content=ft.Container(
+            ft.Column(col, spacing=10, scroll=ft.ScrollMode.AUTO, tight=True), width=420, height=420),
+            actions=[ft.TextButton("취소", on_click=lambda e: page.close(dlg)), ft.FilledButton("다운로드", on_click=go)])
+        page.open(dlg)
+
     def quality_change(e):
         cfg["quality"] = e.control.value
         save_cfg()
@@ -544,7 +721,7 @@ def main(page: ft.Page):
                                    colors=["#5B6CFF", "#A15BFF"]),
         content=ft.Column([
             ft.Text("링크만 붙여넣으세요", size=22, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
-            ft.Text("사진·영상 모두 재인코딩 없이 원본 그대로 저장해요", size=12, color="#E6E6FF"),
+            ft.Text("인스타·유튜브·라이브·음악까지 원본 그대로 저장해요", size=12, color="#E6E6FF"),
             url_field,
             ft.Row([
                 ft.ElevatedButton("붙여넣기", icon=I.CONTENT_PASTE, on_click=paste, expand=True, height=46,
@@ -554,6 +731,9 @@ def main(page: ft.Page):
                                   style=ft.ButtonStyle(bgcolor="#FFFFFF", color="#4A55E0",
                                                        shape=ft.RoundedRectangleBorder(radius=23))),
             ], spacing=10),
+            ft.ElevatedButton("화질 · 용량 미리보기", icon=I.TUNE, on_click=preview, height=44, expand=True,
+                              style=ft.ButtonStyle(bgcolor="#33FFFFFF", color="#FFFFFF",
+                                                   shape=ft.RoundedRectangleBorder(radius=22))),
         ], spacing=10),
     )
 
