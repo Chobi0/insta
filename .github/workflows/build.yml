@@ -14,7 +14,12 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -r requirements.txt
-      - run: flet pack main.py --name ReelDock --product-name ReelDock --hidden-import yt_dlp --hidden-import gallery_dl --collect-all gallery_dl
+      - name: Download deno (YouTube 해독용 JS 런타임)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip -OutFile deno.zip
+          Expand-Archive deno.zip -DestinationPath .
+      - run: flet pack main.py --name ReelDock --product-name ReelDock --hidden-import yt_dlp --hidden-import gallery_dl --collect-all gallery_dl --collect-all yt_dlp_ejs --add-binary "deno.exe;."
       - uses: actions/upload-artifact@v4
         with: { name: ReelDock-exe, path: dist/ReelDock.exe }
 
