@@ -1,0 +1,4 @@
+flet[all]==0.28.3
+yt-dlp
+imageio-ffmpeg
+pyinstaller

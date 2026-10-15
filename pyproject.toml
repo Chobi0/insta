@@ -1,0 +1,20 @@
+[project]
+name = "igsaver"
+version = "1.0.0"
+description = "Instagram Reels/Stories downloader (original quality)"
+requires-python = ">=3.10"
+dependencies = [
+  "flet==0.28.3",
+  "yt-dlp",
+]
+
+[tool.flet]
+org = "com.chobi"
+product = "IGSaver"
+company = "Chobi"
+
+[tool.flet.android.permission]
+"android.permission.INTERNET" = true
+"android.permission.WRITE_EXTERNAL_STORAGE" = true
+"android.permission.READ_EXTERNAL_STORAGE" = true
+"android.permission.MANAGE_EXTERNAL_STORAGE" = true
