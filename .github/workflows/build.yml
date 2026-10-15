@@ -12,7 +12,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }name: build
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  schedule:
+    - cron: "0 3 * * 1"   # 매주 월요일: 최신 yt-dlp로 자동 재빌드
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: flet pack main.py --name ReelDock --product-name ReelDock --hidden-import yt_dlp
+      - uses: actions/upload-artifact@v4
+        with: { name: ReelDock-exe, path: dist/ReelDock.exe }
+
+  android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - run: pip install "flet[all]==0.28.3"
+      - run: flet build apk
+      - uses: actions/upload-artifact@v4
+        with: { name: ReelDock-apk, path: build/apk/*.apk }
+
       - run: pip install -r requirements.txt
       - run: flet pack main.py --name IGSaver --product-name IGSaver --hidden-import yt_dlp
       - uses: actions/upload-artifact@v4
