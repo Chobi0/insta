@@ -1,6 +1,6 @@
 [project]
-name = "igsaver"
-version = "1.0.0"
+name = "reeldock"
+version = "2.0.0"
 description = "Instagram Reels/Stories downloader (original quality)"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,7 +10,7 @@ dependencies = [
 
 [tool.flet]
 org = "com.chobi"
-product = "IGSaver"
+product = "ReelDock"
 company = "Chobi"
 
 [tool.flet.android.permission]
