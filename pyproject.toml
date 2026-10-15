@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
   "flet==0.28.3",
   "yt-dlp",
+  "gallery-dl",
 ]
 
 [tool.flet]

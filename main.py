@@ -13,6 +13,11 @@ from pathlib import Path
 import flet as ft
 import yt_dlp
 
+try:
+    from gallery_dl import config as gdl_config, job as gdl_job
+except Exception:  # 사진/캐러셀/하이라이트용 보조 엔진
+    gdl_config = gdl_job = None
+
 URL_RE = re.compile(r"https?://(?:www\.)?instagram\.com/[^\s]+", re.I)
 SEED = "#5B6CFF"
 MEDIA = {".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".wav", ".flac", ".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -214,7 +219,48 @@ def main(page: ft.Page):
         if cfg["remember"]:
             hist_path.write_text(json.dumps(history, ensure_ascii=False), "utf-8")
 
-    def start_job(url):
+    gdl_lock = threading.Lock()  # gallery-dl 설정은 전역이라 한 번에 하나씩 (계정 보호에도 유리)
+
+    def gdl_download(url, include):
+        if gdl_job is None:
+            raise RuntimeError("gallery-dl을 불러오지 못했어요")
+        out = ensure_outdir()
+        t0 = time.time()
+        with gdl_lock:
+            gdl_config.clear()
+            gdl_config.set((), "base-directory", out)
+            ig = ("extractor", "instagram")
+            gdl_config.set(ig, "directory", ["{username}"])
+            gdl_config.set(ig, "include", include or "posts")
+            gdl_config.set(ig, "sleep-request", [1.0, 3.0])
+            if cfg["skip_dup"]:
+                gdl_config.set(("extractor",), "archive", str(data_dir / "gdl-archive.sqlite3"))
+            sid = cfg["sessionid"].strip()
+            if sid:
+                gdl_config.set(ig, "cookies", {"sessionid": sid})
+            elif not is_android and cfg["browser"] != "없음":
+                gdl_config.set(ig, "cookies", [cfg["browser"].lower()])
+            status = gdl_job.DownloadJob(url).run()
+        files = []
+        for p in Path(out).rglob("*"):
+            try:
+                if p.is_file() and p.stat().st_mtime >= t0 - 1:
+                    files.append(str(p))
+            except Exception:
+                pass
+        if not files:
+            if status & 32:
+                raise RuntimeError("로그인 필요 → 설정에서 sessionid 입력")
+            if status & 8:
+                raise RuntimeError("게시물을 찾을 수 없어요 (삭제/비공개/로그인 필요)")
+            if status & 4:
+                raise RuntimeError("요청 제한 또는 네트워크 오류 → 잠시 후 다시 시도")
+            if status == 0:
+                return files  # 이미 받은 항목
+            raise RuntimeError(f"받을 수 있는 파일이 없어요 (코드 {status})")
+        return files
+
+    def start_job(url, include=None):
         card, title, status, bar = job_card(url, "대기 중...", None)
         jobs_col.controls.insert(0, card)
         page.update()
@@ -225,32 +271,48 @@ def main(page: ft.Page):
                 status.color = color
             page.update()
 
+        def hook(d):
+            if d["status"] == "downloading":
+                tot = d.get("total_bytes") or d.get("total_bytes_estimate")
+                p = (d.get("downloaded_bytes") or 0) / tot if tot else None
+                sp = d.get("speed")
+                setp(f"{(p or 0) * 100:.0f}%  " + (f"{sp / 1048576:.1f}MB/s" if sp else ""), p)
+            elif d["status"] == "finished":
+                setp("처리 중...")
+
+        def by_ytdlp():
+            with yt_dlp.YoutubeDL(build_opts(hook)) as y:
+                info = y.extract_info(url, download=True)
+            if info is None:
+                return None, []
+            return str(info.get("title") or info.get("id") or url)[:80], paths_from(info)
+
+        def by_gdl():
+            setp("게시물/사진 받는 중...")
+            return None, gdl_download(url, include)
+
         def worker():
             with sem["v"]:
-                try:
-                    setp("연결 중...")
-
-                    def hook(d):
-                        if d["status"] == "downloading":
-                            tot = d.get("total_bytes") or d.get("total_bytes_estimate")
-                            p = (d.get("downloaded_bytes") or 0) / tot if tot else None
-                            sp = d.get("speed")
-                            setp(f"{(p or 0) * 100:.0f}%  " + (f"{sp / 1048576:.1f}MB/s" if sp else ""), p)
-                        elif d["status"] == "finished":
-                            setp("처리 중...")
-
-                    with yt_dlp.YoutubeDL(build_opts(hook)) as y:
-                        info = y.extract_info(url, download=True)
-                    if info is None:
-                        setp("이미 받은 항목 (건너뜀)", 1, ft.Colors.AMBER)
+                setp("연결 중...")
+                # 릴스는 yt-dlp(원본 영상+음성 병합) 우선, 그 외(사진·캐러셀·스토리·계정)는 gallery-dl 우선
+                is_reel = re.search(r"/(reel|reels|tv)/", url) and not include
+                order = [by_ytdlp, by_gdl] if is_reel else [by_gdl, by_ytdlp]
+                if include:
+                    order = [by_gdl]
+                first_err = None
+                for fn in order:
+                    try:
+                        t, ps = fn()
+                        title.value = t or (ps[0].replace("\\", "/").split("/")[-1] if ps else url)[:80]
+                        if ps:
+                            setp(f"완료 ✓ ({len(ps)}개)", 1, ft.Colors.GREEN)
+                            add_history(title.value, url, ps)
+                        else:
+                            setp("이미 받은 항목 (건너뜀)", 1, ft.Colors.AMBER)
                         return
-                    t = str(info.get("title") or info.get("id") or url)[:80]
-                    title.value = t
-                    ps = paths_from(info)
-                    setp(f"완료 ✓ ({len(ps)}개)", 1, ft.Colors.GREEN)
-                    add_history(t, url, ps)
-                except Exception as e:
-                    setp("실패: " + friendly_error(e), 0, ft.Colors.RED_300)
+                    except Exception as e:
+                        first_err = first_err or e
+                setp("실패: " + friendly_error(first_err), 0, ft.Colors.RED_300)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -428,7 +490,7 @@ def main(page: ft.Page):
         unlock_vault(lambda: show_custom(vault_view()))
 
     # ================= 홈 =================
-    url_field = ft.TextField(hint_text="인스타 링크를 여기에 붙여넣기 (여러 개 가능)", multiline=True, min_lines=1,
+    url_field = ft.TextField(hint_text="게시물·릴스·스토리 링크 붙여넣기 (여러 개 가능)", multiline=True, min_lines=1,
                              max_lines=4, filled=True, bgcolor="#FFFFFF", color="#1B1B1F", border_radius=16,
                              border=ft.InputBorder.NONE, hint_style=ft.TextStyle(color="#7A7A85", size=13),
                              prefix_icon=I.LINK)
@@ -452,18 +514,22 @@ def main(page: ft.Page):
         url_field.value = ""
         page.update()
 
+    ACCT = {"스토리": "stories", "하이라이트": "highlights", "게시물 전체": "posts",
+            "릴스 전체": "reels", "전부 (게시물+릴스+스토리+하이라이트)": "posts,reels,stories,highlights"}
+
     def story_dialog(e=None):
         u = ft.TextField(label="사용자명 (@ 제외)", autofocus=True)
+        kind = ft.Dropdown(label="받을 항목", value="스토리", options=[ft.dropdown.Option(k) for k in ACCT])
 
         def go(ev):
             name = (u.value or "").strip().lstrip("@")
             if name:
                 page.close(dlg)
                 if not cfg["sessionid"].strip() and cfg["browser"] == "없음":
-                    toast("스토리는 로그인이 필요해요 → 설정에서 sessionid 입력")
-                start_job(f"https://www.instagram.com/stories/{name}/")
+                    toast("스토리/전체 받기는 로그인이 필요해요 → 설정에서 sessionid 입력")
+                start_job(f"https://www.instagram.com/{name}/", ACCT[kind.value])
 
-        dlg = ft.AlertDialog(title=ft.Text("스토리 전체 받기"), content=u,
+        dlg = ft.AlertDialog(title=ft.Text("계정에서 받기"), content=ft.Column([u, kind], tight=True, spacing=12),
                              actions=[ft.TextButton("취소", on_click=lambda e: page.close(dlg)),
                                       ft.FilledButton("받기", on_click=go)])
         page.open(dlg)
@@ -478,7 +544,7 @@ def main(page: ft.Page):
                                    colors=["#5B6CFF", "#A15BFF"]),
         content=ft.Column([
             ft.Text("링크만 붙여넣으세요", size=22, weight=ft.FontWeight.BOLD, color="#FFFFFF"),
-            ft.Text("재인코딩 없이 해상도·fps 그대로 저장해요", size=12, color="#E6E6FF"),
+            ft.Text("사진·영상 모두 재인코딩 없이 원본 그대로 저장해요", size=12, color="#E6E6FF"),
             url_field,
             ft.Row([
                 ft.ElevatedButton("붙여넣기", icon=I.CONTENT_PASTE, on_click=paste, expand=True, height=46,
@@ -505,7 +571,7 @@ def main(page: ft.Page):
         padding=10, border_radius=24, bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
         content=ft.Column([
             ft.Row([tile(I.PHOTO_LIBRARY, "갤러리", lambda e: show(1)),
-                    tile(I.AUTO_STORIES, "스토리 받기", story_dialog),
+                    tile(I.AUTO_STORIES, "계정/스토리", story_dialog),
                     tile(I.MUSIC_NOTE, "오디오 추출", lambda e: open_tool(t_all["aext"]))]),
             ft.Row([tile(I.CONTENT_CUT, "동영상 자르기", lambda e: open_tool(t_all["trim"])),
                     tile(I.COMPRESS, "동영상 압축", lambda e: open_tool(t_all["compress"])),
